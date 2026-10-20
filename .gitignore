@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.ruff_cache/
+.pytest_cache/
+
+# Virtual Environments
+.venv/
+.venv*/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Streamlit local config & runtime data
+.streamlit/secrets.toml
+
+# Application uploads and generated vector indices (only structure preserved)
+data/uploads/*
+!data/uploads/.gitkeep
+data/index/*
+!data/index/.gitkeep
+
+# Logs and temporary files
+*.log
+install_log.txt
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
