@@ -1,135 +1,113 @@
 """
 Evaluation Runner
-==================
-Runs a curated test set through the retrieval + generation pipeline
-and computes evaluation metrics. Supports ablation modes.
+=================
+Runs test sets across Dense, BM25, and Hybrid retrieval methods without any LLM calls.
+Computes Recall@3 and Precision@3.
 """
+from __future__ import annotations
 
 import logging
-import time
-
+from core.evaluation.metrics import evaluate_retrieval_case
 from core.retrieval.hybrid_retriever import hybrid_search
-from core.generation.answer_generator import answer_query
-from core.evaluation.metrics import compute_all_metrics
 
 logger = logging.getLogger(__name__)
 
 
-def run_evaluation(
-    test_set: list[dict],
-    collection_name: str = "course_material",
-    k_values: list[int] = [1, 3, 5],
-    mode: str = "hybrid",
-    progress_callback=None,
+def run_retrieval_evaluation(
+    eval_cases: list[dict],
+    k: int = 3,
 ) -> dict:
     """
-    Run evaluation on a curated test set.
+    Run evaluation on a test set for three retrieval methods:
+    1) Dense Only
+    2) BM25 Only
+    3) Hybrid (Dense + BM25)
 
-    Args:
-        test_set: List of test cases:
-            [{"question": str, "expected_chunk_ids": [str], "expected_answer": str}]
-        collection_name: Collection to evaluate against.
-        k_values: K values for retrieval metrics.
-        mode: "hybrid", "dense_only", or "sparse_only" for ablation.
-        progress_callback: Optional callable(current, total) for progress updates.
+    Each test case must have:
+      question: str
+      expected_doc: str
+      expected_page: int | str | None (optional)
 
-    Returns:
-        Evaluation results dict.
+    Returns dict with summary metrics and per-case results.
     """
-    logger.info(f"Running evaluation ({mode}) on {len(test_set)} test cases...")
-    start_time = time.time()
+    if not eval_cases:
+        return {
+            "summary": {},
+            "case_results": [],
+            "total_cases": 0,
+        }
 
-    results = []
-    all_metrics: dict[str, list[float]] = {}
-    failed = 0
-
-    for i, test_case in enumerate(test_set):
-        question = test_case.get("question", "")
-        expected_chunk_ids = test_case.get("expected_chunk_ids", [])
-        expected_answer = test_case.get("expected_answer", "")
-
-        if progress_callback:
-            progress_callback(i, len(test_set))
-
-        logger.info(f"Evaluating [{i + 1}/{len(test_set)}]: {question[:60]}...")
-
-        try:
-            # Run retrieval
-            retrieved = hybrid_search(
-                query=question,
-                collection=collection_name,
-                mode=mode,
-            )
-            retrieved_ids = [r["chunk_id"] for r in retrieved]
-
-            # Run full answer generation
-            answer_result = answer_query(
-                query=question,
-                collection=collection_name,
-                mode=mode,
-            )
-            generated_answer = answer_result.get("answer", "")
-
-            # Compute metrics
-            metrics = compute_all_metrics(
-                retrieved_ids=retrieved_ids,
-                relevant_ids=expected_chunk_ids,
-                generated_answer=generated_answer,
-                reference_answer=expected_answer,
-                k_values=k_values,
-            )
-
-            # Accumulate for averages
-            for metric_name, value in metrics.items():
-                if metric_name not in all_metrics:
-                    all_metrics[metric_name] = []
-                all_metrics[metric_name].append(value)
-
-            results.append({
-                "question": question,
-                "generated_answer": generated_answer[:500],
-                "expected_answer": expected_answer[:500],
-                "confidence": answer_result.get("confidence", 0),
-                "is_grounded": answer_result.get("is_grounded", False),
-                "retrieved_chunk_ids": retrieved_ids,
-                "expected_chunk_ids": expected_chunk_ids,
-                "metrics": metrics,
-                "status": "success",
-            })
-
-        except Exception as e:
-            logger.error(f"Evaluation failed for question '{question[:40]}': {e}")
-            failed += 1
-            results.append({
-                "question": question,
-                "status": "error",
-                "error": str(e),
-                "metrics": {},
-            })
-
-    if progress_callback:
-        progress_callback(len(test_set), len(test_set))
-
-    elapsed = round(time.time() - start_time, 2)
-
-    # Compute aggregate (average) metrics
-    aggregate = {}
-    for metric_name, values in all_metrics.items():
-        if values:
-            aggregate[metric_name] = round(sum(values) / len(values), 4)
-
-    eval_result = {
-        "total_cases": len(test_set),
-        "completed": len(test_set) - failed,
-        "failed": failed,
-        "elapsed_seconds": elapsed,
-        "aggregate_metrics": aggregate,
-        "per_question_results": results,
-        "mode": mode,
+    methods = ["dense_only", "sparse_only", "hybrid"]
+    method_labels = {
+        "dense_only": "Dense (FAISS)",
+        "sparse_only": "BM25 Only",
+        "hybrid": "Hybrid RRF",
     }
 
-    logger.info(
-        f"Evaluation complete ({mode}): {eval_result['completed']}/{eval_result['total_cases']} "
-        f"cases in {elapsed}s. Aggregate: {aggregate}"
-    )
-    return eval_result
+    scores = {m: {"precisions": [], "recalls": []} for m in methods}
+    detailed_cases = []
+
+    for idx, case in enumerate(eval_cases):
+        question = case.get("question", "").strip()
+        expected_doc = case.get("expected_doc", "").strip()
+        expected_page = case.get("expected_page")
+
+        case_entry = {
+            "index": idx + 1,
+            "question": question,
+            "expected_doc": expected_doc,
+            "expected_page": expected_page,
+            "results": {},
+        }
+
+        for method in methods:
+            try:
+                retrieved = hybrid_search(
+                    query=question,
+                    top_k_final=k,
+                    mode=method,
+                )
+            except Exception as e:
+                logger.warning(f"Retrieval failed for case {idx} method {method}: {e}")
+                retrieved = []
+
+            p, r = evaluate_retrieval_case(
+                retrieved_chunks=retrieved,
+                expected_doc=expected_doc,
+                expected_page=expected_page,
+                k=k,
+            )
+
+            scores[method]["precisions"].append(p)
+            scores[method]["recalls"].append(r)
+
+            case_entry["results"][method] = {
+                "precision": p,
+                "recall": r,
+                "retrieved": [
+                    f"{c.get('metadata', {}).get('doc_name')} · p.{c.get('metadata', {}).get('page_or_slide')}"
+                    for c in retrieved
+                ],
+            }
+
+        detailed_cases.append(case_entry)
+
+    summary = {}
+    for m in methods:
+        label = method_labels[m]
+        p_list = scores[m]["precisions"]
+        r_list = scores[m]["recalls"]
+
+        avg_p = sum(p_list) / len(p_list) if p_list else 0.0
+        avg_r = sum(r_list) / len(r_list) if r_list else 0.0
+
+        summary[label] = {
+            "Precision@3": round(avg_p, 4),
+            "Recall@3": round(avg_r, 4),
+        }
+
+    return {
+        "summary": summary,
+        "case_results": detailed_cases,
+        "total_cases": len(eval_cases),
+    }

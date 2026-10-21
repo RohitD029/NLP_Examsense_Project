@@ -1,52 +1,68 @@
 """
 Hybrid Retriever
-=================
-Combines dense (FAISS) and sparse (BM25) results with Reciprocal Rank Fusion.
-Returns top_k_final chunks with dense_score, bm25_score, rrf_score, confidence.
+================
+Combines dense (FAISS IndexFlatIP) and sparse (BM25Plus) results using Reciprocal Rank Fusion.
+Returns ranked chunks with dense_score, bm25_score, rrf_score, and internal confidence.
 """
 from __future__ import annotations
 
 import logging
 from typing import Literal, Optional
 
+from core.config import settings
+from core.retrieval.bm25_index import query_bm25
+from core.retrieval.embedder import embed_query
+from core.retrieval.vector_store import get_bm25_data, query_dense
+
 logger = logging.getLogger(__name__)
 
 
 def hybrid_search(
     query: str,
-    collection: str = "course_material",
     top_k_final: int | None = None,
     mode: Literal["hybrid", "dense_only", "sparse_only"] = "hybrid",
     doc_filter: Optional[str] = None,
+    **kwargs,  # Accept legacy collection arg if passed
 ) -> list[dict]:
     """
-    Run hybrid retrieval and return merged, ranked results.
+    Run retrieval (dense, sparse, or hybrid RRF) on the current session store.
 
     Each result dict has:
-      chunk_id, text, metadata, collection,
+      chunk_id, text, metadata,
       dense_score, bm25_score, rrf_score, confidence
     """
-    from core.config import settings
-    from core.retrieval.embedder import embed_query
-    from core.retrieval.vector_store import query_dense
-    from core.retrieval.bm25_index import query_index
-
     k_final = top_k_final or settings.top_k_final
+    cand_mult = 4 if (doc_filter and doc_filter != "All documents") else 1
 
     dense_results: list[dict] = []
     sparse_results: list[dict] = []
 
-    # If filtering by doc, retrieve more initial candidates to avoid empty pools
-    cand_mult = 4 if (doc_filter and doc_filter != "All documents") else 1
-
+    # 1. Dense retrieval
     if mode in ("hybrid", "dense_only"):
-        q_emb = embed_query(query)
-        dense_results = query_dense(q_emb, collection, top_k=settings.top_k_dense * cand_mult)
+        try:
+            q_emb = embed_query(query)
+            dense_results = query_dense(
+                query_vector=q_emb,
+                top_k=settings.top_k_dense * cand_mult,
+                doc_filter=doc_filter,
+            )
+        except Exception as e:
+            logger.warning(f"Dense search error: {e}")
 
+    # 2. Sparse (BM25) retrieval
     if mode in ("hybrid", "sparse_only"):
-        sparse_results = query_index(query, collection, top_k=settings.top_k_sparse * cand_mult)
+        try:
+            bm25_data = get_bm25_data()
+            sparse_results = query_bm25(
+                query=query,
+                bm25_data=bm25_data,
+                top_k=settings.top_k_sparse * cand_mult,
+                doc_filter=doc_filter,
+            )
+        except Exception as e:
+            logger.warning(f"Sparse search error: {e}")
 
-    # Apply doc_filter if requested
+    # Filter again if not already filtered
     if doc_filter and doc_filter != "All documents":
         dense_results = [
             r for r in dense_results if r.get("metadata", {}).get("doc_name") == doc_filter
@@ -58,23 +74,25 @@ def hybrid_search(
     if not dense_results and not sparse_results:
         return []
 
+    # 3. Dense-only mode
     if mode == "dense_only":
         results = dense_results[:k_final]
         for r in results:
-            r["dense_score"] = r.pop("score", 0.0)
+            r["dense_score"] = r.get("score", 0.0)
             r["bm25_score"] = 0.0
             r["rrf_score"] = r["dense_score"]
         return _add_confidence(results, mode)
 
+    # 4. Sparse-only mode
     if mode == "sparse_only":
         results = sparse_results[:k_final]
         for r in results:
-            r["bm25_score"] = r.pop("score", 0.0)
+            r["bm25_score"] = r.get("score", 0.0)
             r["dense_score"] = 0.0
             r["rrf_score"] = r["bm25_score"]
         return _add_confidence(results, mode)
 
-    # ── Hybrid: RRF ──────────────────────────────────────────────────────────
+    # 5. Hybrid mode (Reciprocal Rank Fusion)
     K = settings.rrf_k
     scores: dict[str, dict] = {}
 
@@ -119,16 +137,12 @@ def hybrid_search(
 
 
 def _add_confidence(results: list[dict], mode: str) -> list[dict]:
-    """
-    Compute per-result confidence and a top-level confidence for the query.
-    Confidence = weighted average of dense cosine (60%) + BM25 rank agreement (40%).
-    """
+    """Compute internal confidence score for retrieval evidence."""
     if not results:
         return results
 
     max_bm25 = max((r.get("bm25_score", 0.0) for r in results), default=0.0)
 
-    # Normalise BM25 score to [0,1]
     for r in results:
         bm25_norm = (r.get("bm25_score", 0.0) / max_bm25) if max_bm25 > 0 else 0.0
         dense = r.get("dense_score", 0.0)

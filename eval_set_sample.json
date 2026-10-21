@@ -1,0 +1,77 @@
+[
+  {
+    "question": "How do subword tokenizers handle out of vocabulary words?",
+    "expected_doc": "NLP_Lecture_01_Foundations.pdf",
+    "expected_page": 1
+  },
+  {
+    "question": "What is the standard evaluation metric for language modeling quality?",
+    "expected_doc": "NLP_Lecture_01_Foundations.pdf",
+    "expected_page": 2
+  },
+  {
+    "question": "What is the core difference between Word2Vec CBOW and Skip-Gram?",
+    "expected_doc": "NLP_Lecture_01_Foundations.pdf",
+    "expected_page": 3
+  },
+  {
+    "question": "Why do standard recurrent networks struggle with long distance dependencies?",
+    "expected_doc": "NLP_Lecture_01_Foundations.pdf",
+    "expected_page": 4
+  },
+  {
+    "question": "What are the three gating mechanisms that control cell state in LSTM?",
+    "expected_doc": "NLP_Lecture_01_Foundations.pdf",
+    "expected_page": 5
+  },
+  {
+    "question": "Why can transformers be trained in parallel compared to recurrent architectures?",
+    "expected_doc": "Deep_Learning_Transformers.pdf",
+    "expected_page": 1
+  },
+  {
+    "question": "What is the mathematical formulation and scaling factor of scaled dot product attention?",
+    "expected_doc": "Deep_Learning_Transformers.pdf",
+    "expected_page": 2
+  },
+  {
+    "question": "How does multi-head attention project queries, keys, and values across representation subspaces?",
+    "expected_doc": "Deep_Learning_Transformers.pdf",
+    "expected_page": 3
+  },
+  {
+    "question": "How are sinusoidal positional encodings calculated for odd and even dimensions?",
+    "expected_doc": "Deep_Learning_Transformers.pdf",
+    "expected_page": 4
+  },
+  {
+    "question": "What pre-training tasks are used by BERT to learn bidirectional representations?",
+    "expected_doc": "Deep_Learning_Transformers.pdf",
+    "expected_page": 5
+  },
+  {
+    "question": "How does the Adam optimizer combine first and second momentum estimates?",
+    "expected_doc": "Optimization_and_Evaluation.docx",
+    "expected_page": 1
+  },
+  {
+    "question": "Why are learning rate warmup schedules used during deep model training?",
+    "expected_doc": "Optimization_and_Evaluation.docx",
+    "expected_page": 2
+  },
+  {
+    "question": "How does BLEU score compute n-gram precision and brevity penalty?",
+    "expected_doc": "Optimization_and_Evaluation.docx",
+    "expected_page": 3
+  },
+  {
+    "question": "What is the difference between ROUGE-1, ROUGE-2, and ROUGE-L in summarization?",
+    "expected_doc": "Optimization_and_Evaluation.docx",
+    "expected_page": 4
+  },
+  {
+    "question": "What regularization methods prevent neural networks from overfitting on training data?",
+    "expected_doc": "Optimization_and_Evaluation.docx",
+    "expected_page": 5
+  }
+]

@@ -1,262 +1,263 @@
 """
 Answer Generator
-=================
-Full pipeline: query → hybrid retrieval → confidence check → LLM → citations.
+================
+Orchestrates retrieval -> evidence check -> Groq generation -> source chips.
+Never calls LLM when evidence is weak.
+Handles summary queries with spread-out chunks.
+Builds source chips from retrieved chunks and strips invented citation markers.
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
+
+from core.config import settings
+from core.generation.llm_client import generate_answer
+from core.retrieval.hybrid_retriever import hybrid_search
+from core.retrieval.vector_store import get_all_chunks, get_document_names
 
 logger = logging.getLogger(__name__)
 
+NOT_FOUND_MESSAGE = "I couldn't find this in your documents. Try rephrasing or upload more material."
 
-def answer_query(
-    query: str,
-    collection: str = "course_material",
-    top_k: int | None = None,
-    mode: str = "hybrid",
-    doc_filter: Optional[str] = None,
-) -> dict:
+
+def strip_invented_citations(text: str, num_chunks: int) -> str:
     """
-    Returns:
-      query, answer, confidence, is_grounded, abstained,
-      citations, model_info, retrieval_info, error?
+    Strip any citation markers [n] that the model invents beyond the provided chunks,
+    or invalid markers.
     """
-    from core.config import settings
-    from core.retrieval.hybrid_retriever import hybrid_search
-    from core.generation.llm_client import generate_answer, _strip_invalid_citations
+    def _replace(match):
+        n = int(match.group(1))
+        if 1 <= n <= num_chunks:
+            return match.group(0)
+        return ""
 
-    # ── Summary Mode Check ───────────────────────────────────────────────────
-    if is_summary_query(query, doc_filter):
-        return _handle_summary(query, collection, doc_filter)
-
-    k = top_k or settings.top_k_final
-
-    # ── Retrieval ─────────────────────────────────────────────────────────────
-    chunks = hybrid_search(
-        query=query,
-        collection=collection,
-        top_k_final=k,
-        mode=mode,
-        doc_filter=doc_filter,
-    )
-
-    if not chunks:
-        return _not_found(query, "No matching content in your uploaded documents.")
-
-    top_conf = chunks[0].get("confidence", 0.0)
-    top_dense = chunks[0].get("dense_score", 0.0)
-    top_bm25 = chunks[0].get("bm25_score", 0.0)
-
-    # Abstain if BOTH dense and BM25 evidence are weak
-    dense_weak = top_dense < settings.confidence_threshold
-    bm25_weak = top_bm25 < settings.confidence_threshold * 0.5  # BM25 scores differ in scale
-    should_abstain = dense_weak and (bm25_weak or mode == "dense_only")
-
-    if should_abstain:
-        return _low_confidence(query, chunks, top_conf)
-
-    # ── LLM call ─────────────────────────────────────────────────────────────
-    llm = generate_answer(query=query, context_chunks=chunks)
-
-    if llm.get("error") and not llm.get("answer"):
-        # No LLM but we have retrieved passages — return retrieval-only result
-        return _retrieval_only(query, chunks, llm["error"])
-
-    answer_text = llm["answer"]
-    # Strip invalid [N] citations invented by the model
-    answer_text = _strip_invalid_citations(answer_text, len(chunks))
-
-    # ── Citations ─────────────────────────────────────────────────────────────
-    citations = _build_citations(chunks)
-
-    # ── Confidence ────────────────────────────────────────────────────────────
-    llm_conf = llm.get("raw_confidence", 0.5)
-    final_conf = round(0.6 * llm_conf + 0.4 * top_conf, 2)
-
-    return {
-        "query": query,
-        "answer": answer_text,
-        "confidence": final_conf,
-        "is_grounded": not llm.get("abstained", False),
-        "abstained": llm.get("abstained", False),
-        "citations": citations,
-        "retrieved_chunks": chunks,
-        "model_info": {
-            "model": llm.get("model_used", ""),
-            "provider": llm.get("provider", ""),
-        },
-        "retrieval_info": {
-            "total_candidates": len(chunks),
-            "top_dense_score": round(top_dense, 4),
-            "top_bm25_score": round(top_bm25, 4),
-            "top_confidence": round(top_conf, 4),
-        },
-    }
+    cleaned = re.sub(r"\[(\d+)\]", _replace, text)
+    # Clean up any resulting double spaces
+    return re.sub(r" +", " ", cleaned).strip()
 
 
-def _build_citations(chunks: list[dict]) -> list[dict]:
-    return [
-        {
-            "index": i + 1,
-            "doc_name": c.get("metadata", {}).get("doc_name", "?"),
-            "page_or_slide": c.get("metadata", {}).get("page_or_slide", "?"),
-            "heading": c.get("metadata", {}).get("heading", ""),
-            "text_excerpt": c["text"][:300] + ("…" if len(c["text"]) > 300 else ""),
-            "dense_score": round(c.get("dense_score", 0.0), 4),
-            "confidence": round(c.get("confidence", 0.0), 4),
-        }
-        for i, c in enumerate(chunks)
-    ]
-
-
-def _not_found(query: str, reason: str) -> dict:
-    return {
-        "query": query, "answer": "", "confidence": 0.0,
-        "is_grounded": False, "abstained": True,
-        "citations": [], "retrieved_chunks": [],
-        "model_info": {"model": "", "provider": ""},
-        "retrieval_info": {"total_candidates": 0, "top_dense_score": 0.0,
-                           "top_bm25_score": 0.0, "top_confidence": 0.0},
-        "not_found_reason": reason,
-    }
-
-
-def _low_confidence(query: str, chunks: list[dict], conf: float) -> dict:
-    base = _not_found(query, "Below confidence threshold.")
-    base["confidence"] = round(conf * 0.5, 2)
-    base["citations"] = _build_citations(chunks[:3])
-    base["retrieved_chunks"] = chunks[:3]
-    return base
-
-
-def _retrieval_only(query: str, chunks: list[dict], error: str) -> dict:
-    return {
-        "query": query,
-        "answer": "",
-        "confidence": chunks[0].get("confidence", 0.0) if chunks else 0.0,
-        "is_grounded": False,
-        "abstained": True,
-        "citations": _build_citations(chunks),
-        "retrieved_chunks": chunks,
-        "model_info": {"model": "none", "provider": "none"},
-        "retrieval_info": {
-            "total_candidates": len(chunks),
-            "top_dense_score": chunks[0].get("dense_score", 0.0) if chunks else 0.0,
-            "top_bm25_score": chunks[0].get("bm25_score", 0.0) if chunks else 0.0,
-            "top_confidence": chunks[0].get("confidence", 0.0) if chunks else 0.0,
-        },
-        "error": error,
-    }
-
-
-def is_summary_query(query: str, doc_filter: str | None = None) -> bool:
-    """Detect if query is asking for a summary/overview of a document."""
+def is_summary_query(query: str) -> bool:
+    """Check if query is asking for a summary/overview of a document."""
     q = query.lower().strip()
     triggers = [
         "what is this", "what is the document", "about", "summarize", "summarise",
         "summary", "overview", "main topic", "main topics", "main points", "tell me about",
         "what does this", "explain this presentation", "explain this ppt", "explain this document",
-        "outline", "key takeaways", "table of contents", "introduction",
+        "outline", "key takeaways", "key definitions", "table of contents", "introduction",
     ]
-    if any(t in q for t in triggers):
-        return True
-    if doc_filter and doc_filter != "All documents" and len(q.split()) <= 6:
-        return True
-    return False
+    return any(t in q for t in triggers)
 
 
-def _handle_summary(
+def generate_study_answer(
     query: str,
-    collection: str,
-    doc_filter: str | None,
+    doc_filter: Optional[str] = None,
 ) -> dict:
-    from core.retrieval.vector_store import get_all_chunks, get_document_names
-    from core.generation.llm_client import generate_answer, _strip_invalid_citations
+    """
+    Main answering entry point.
+    Returns:
+      answer: str
+      source_chips: list of dicts (label, doc_name, page_or_slide, excerpt, heading)
+      not_found: bool
+      error: str | None
+      is_summary: bool
+    """
+    # ── Summary Mode ──────────────────────────────────────────────────────────
+    if is_summary_query(query):
+        return _handle_summary(query, doc_filter)
 
-    all_col_chunks = get_all_chunks(collection)
-    if not all_col_chunks:
-        return _not_found(query, "No documents uploaded in this collection.")
+    # ── Hybrid Retrieval ──────────────────────────────────────────────────────
+    retrieved = hybrid_search(
+        query=query,
+        top_k_final=settings.top_k_final,
+        mode="hybrid",
+        doc_filter=doc_filter,
+    )
 
-    # Determine target document
+    if not retrieved:
+        # Nothing retrieved at all -> abstain without calling LLM
+        return {
+            "answer": NOT_FOUND_MESSAGE,
+            "source_chips": [],
+            "not_found": True,
+            "error": None,
+            "is_summary": False,
+        }
+
+    # ── Evidence Check ────────────────────────────────────────────────────────
+    top_dense = retrieved[0].get("dense_score", 0.0)
+    top_bm25 = retrieved[0].get("bm25_score", 0.0)
+
+    dense_weak = top_dense < settings.confidence_threshold
+    bm25_weak = top_bm25 <= 0.0
+
+    # Abstain only when BOTH dense and BM25 evidence are weak
+    if dense_weak and bm25_weak:
+        return {
+            "answer": NOT_FOUND_MESSAGE,
+            "source_chips": [],
+            "not_found": True,
+            "error": None,
+            "is_summary": False,
+        }
+
+    # ── Call LLM ──────────────────────────────────────────────────────────────
+    top_chunks = retrieved[:settings.top_k_final]
+    llm_resp = generate_answer(query=query, context_chunks=top_chunks)
+
+    if llm_resp.get("error"):
+        return {
+            "answer": "",
+            "source_chips": _build_source_chips(top_chunks),
+            "not_found": False,
+            "error": llm_resp["error"],
+            "is_summary": False,
+        }
+
+    raw_answer = llm_resp.get("answer", "").strip()
+
+    if llm_resp.get("abstained") or not raw_answer or NOT_FOUND_MESSAGE.lower() in raw_answer.lower():
+        return {
+            "answer": NOT_FOUND_MESSAGE,
+            "source_chips": [],
+            "not_found": True,
+            "error": None,
+            "is_summary": False,
+        }
+
+    # Strip invented [n] citations
+    clean_answer = strip_invented_citations(raw_answer, len(top_chunks))
+    source_chips = _build_source_chips(top_chunks)
+
+    return {
+        "answer": clean_answer,
+        "source_chips": source_chips,
+        "not_found": False,
+        "error": None,
+        "is_summary": False,
+    }
+
+
+def _handle_summary(query: str, doc_filter: Optional[str] = None) -> dict:
+    """Handle summary queries: skip evidence check, select spread-out chunks (max 6)."""
+    all_chunks = get_all_chunks(doc_filter)
+    if not all_chunks:
+        return {
+            "answer": NOT_FOUND_MESSAGE,
+            "source_chips": [],
+            "not_found": True,
+            "error": None,
+            "is_summary": True,
+        }
+
+    # Target document selection
     target_doc = doc_filter if (doc_filter and doc_filter != "All documents") else None
     if not target_doc:
-        doc_names = get_document_names(collection)
-        if len(doc_names) == 1:
-            target_doc = doc_names[0]
-        else:
-            # Pick first available or best match
-            target_doc = doc_names[0]
+        doc_names = get_document_names()
+        target_doc = doc_names[0] if doc_names else None
 
-    # Get all chunks for this doc
-    doc_chunks = [
-        c for c in all_col_chunks
-        if c.get("metadata", {}).get("doc_name") == target_doc
-    ]
+    if target_doc:
+        doc_chunks = [c for c in all_chunks if c.get("metadata", {}).get("doc_name") == target_doc]
+    else:
+        doc_chunks = all_chunks
+
     if not doc_chunks:
-        doc_chunks = all_col_chunks[:10]
+        doc_chunks = all_chunks
 
     # Sort chunks by page/slide and chunk index
     doc_chunks.sort(
         key=lambda c: (
             int(c.get("metadata", {}).get("page_or_slide", 0) or 0),
-            int(c.get("metadata", {}).get("chunk_index", 0) or 0)
+            int(c.get("metadata", {}).get("chunk_index", 0) or 0),
         )
     )
 
-    # Pick a spread of chunks (max ~8)
-    if len(doc_chunks) <= 8:
+    # Pick spread-out chunks: up to max 6 chunks
+    if len(doc_chunks) <= 6:
         selected_chunks = doc_chunks
     else:
+        # Take first 2 chunks + evenly spread remaining up to 6 total
         selected_chunks = [doc_chunks[0], doc_chunks[1]]
         remaining = doc_chunks[2:]
-        step = max(1, len(remaining) // 6)
+        step = max(1, len(remaining) // 4)
         for i in range(0, len(remaining), step):
-            if len(selected_chunks) < 8:
+            if len(selected_chunks) < 6:
                 selected_chunks.append(remaining[i])
 
-    summary_prompt = (
-        "You are ExamSense, an academic study assistant. "
-        "The student is asking for a summary/overview of the document. "
-        "Summarize what this document is about, its key sections, main points, and takeaways "
-        "ONLY from the numbered source passages below. "
-        "Cite sources as [1], [2], etc. matching the passage numbers given to you. "
-        "Do not invent citations. Keep your answer structured, clear, and informative. "
-        "End with **Confidence: 0.95**."
+    summary_system_prompt = (
+        "Answer ONLY from the numbered excerpts. "
+        "Summarize the key topics, main definitions, and core concepts. "
+        "Be concise, at most 120 words unless asked for more. "
+        "Cite like [1]. "
+        "If the answer is not in the excerpts, reply exactly: "
+        "I couldn't find this in your documents."
     )
 
-    llm = generate_answer(
+    llm_resp = generate_answer(
         query=query,
         context_chunks=selected_chunks,
-        system_prompt=summary_prompt,
+        system_prompt=summary_system_prompt,
     )
 
-    if llm.get("error") and not llm.get("answer"):
-        return _retrieval_only(query, selected_chunks, llm["error"])
+    if llm_resp.get("error"):
+        return {
+            "answer": "",
+            "source_chips": _build_source_chips(selected_chunks),
+            "not_found": False,
+            "error": llm_resp["error"],
+            "is_summary": True,
+        }
 
-    answer_text = _strip_invalid_citations(llm.get("answer", ""), len(selected_chunks))
-    citations = _build_citations(selected_chunks)
+    raw_answer = llm_resp.get("answer", "").strip()
+    if llm_resp.get("abstained") or not raw_answer or NOT_FOUND_MESSAGE.lower() in raw_answer.lower():
+        return {
+            "answer": NOT_FOUND_MESSAGE,
+            "source_chips": [],
+            "not_found": True,
+            "error": None,
+            "is_summary": True,
+        }
+
+    clean_answer = strip_invented_citations(raw_answer, len(selected_chunks))
+    source_chips = _build_source_chips(selected_chunks)
 
     return {
-        "query": query,
-        "answer": answer_text,
-        "confidence": 0.95,
-        "is_grounded": True,
-        "abstained": False,
-        "citations": citations,
-        "retrieved_chunks": selected_chunks,
-        "model_info": {
-            "model": llm.get("model_used", ""),
-            "provider": llm.get("provider", ""),
-        },
-        "retrieval_info": {
-            "total_candidates": len(selected_chunks),
-            "top_dense_score": 1.0,
-            "top_bm25_score": 1.0,
-            "top_confidence": 0.95,
-            "is_summary_mode": True,
-            "target_document": target_doc,
-        },
+        "answer": clean_answer,
+        "source_chips": source_chips,
+        "not_found": False,
+        "error": None,
+        "is_summary": True,
     }
 
+
+def _build_source_chips(chunks: list[dict]) -> list[dict]:
+    """
+    Build source chips from retrieved chunks.
+    Chips show: filename · p.4 (or slide / chapter).
+    """
+    chips = []
+    seen = set()
+
+    for idx, c in enumerate(chunks, 1):
+        meta = c.get("metadata", {})
+        doc = meta.get("doc_name", "Document")
+        page = meta.get("page_or_slide", 1)
+        heading = meta.get("heading", "")
+
+        label = f"{doc} · p.{page}"
+        key = (doc, page)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        chips.append({
+            "index": idx,
+            "label": label,
+            "doc_name": doc,
+            "page_or_slide": page,
+            "heading": heading,
+            "excerpt": c["text"],
+        })
+
+    return chips

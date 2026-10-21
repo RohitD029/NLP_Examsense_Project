@@ -1,215 +1,235 @@
 """
 Document Processor
 ==================
-Orchestrates ingestion: detect format → extract → chunk → return report.
+Dispatches file formats, enforces validation rules, rejects scanned/image-based files,
+and prepares chunks for in-memory session indexing.
 """
 from __future__ import annotations
 
 import logging
-import uuid
+import os
+import tempfile
 from pathlib import Path
-from typing import Optional
+
+from core.config import settings
+from core.ingestion.chunker import chunk_pages
+from core.nlp.preprocess import clean_text
 
 logger = logging.getLogger(__name__)
 
-EXTRACTORS = {
-    ".pdf": "core.ingestion.pdf_extractor.extract_text_from_pdf",
-    ".pptx": "core.ingestion.pptx_extractor.extract_text_from_pptx",
-    ".ppt": "core.ingestion.pptx_extractor.extract_text_from_pptx",
-    ".docx": "core.ingestion.docx_extractor.extract_text_from_docx",
-    ".doc": "core.ingestion.docx_extractor.extract_text_from_docx",
-    ".epub": "core.ingestion.epub_extractor.extract_text_from_epub",
-    ".txt": "_txt",
-    ".md": "_txt",
-    ".png": "_img",
-    ".jpg": "_img",
-    ".jpeg": "_img",
-}
+SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".docx", ".epub", ".txt", ".md"}
+UNSUPPORTED_TYPE_MESSAGE = (
+    "Unsupported file type. Please upload PDF, PPTX, DOCX, EPUB, TXT or MD."
+)
+SCANNED_FILE_MESSAGE = (
+    "This file looks scanned or image-based, so I can't read it. "
+    "This app only supports text-based files. "
+    "Please upload a version where you can select the text."
+)
 
 
 def get_supported_extensions() -> list[str]:
-    return list(EXTRACTORS.keys())
+    return sorted(list(SUPPORTED_EXTENSIONS))
 
 
-def process_document(
-    file_path: str,
-    original_filename: str,
-    collection: str = "course_material",
-    year: Optional[str] = None,
-    subject: Optional[str] = None,
-) -> dict:
+def is_supported_file(filename: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    return suffix in SUPPORTED_EXTENSIONS
+
+
+def process_uploaded_file(file_bytes: bytes, filename: str) -> dict:
     """
-    Process a single document.
+    Process an uploaded document from memory bytes.
 
-    Returns report dict:
-      doc_id, doc_name, collection, total_pages, total_chunks,
-      chunks_list (Chunk.to_dict()), pages_ocr'd, chars_extracted,
-      status, message, extraction_warnings
+    Returns dict:
+      success: bool
+      doc_name: str
+      chunks: list of dicts (chunk_id, text, metadata)
+      total_pages: int
+      skipped_pages: int
+      status_note: str  ("Ready" or "N pages/slides had no readable text and were skipped.")
+      error: str | None
     """
-    from core.ingestion.chunker import chunk_pages
-
-    path = Path(file_path)
+    path = Path(filename)
     suffix = path.suffix.lower()
 
-    if suffix not in EXTRACTORS:
-        return _error_report(original_filename, collection, f"Unsupported format: {suffix}")
+    # 1. Extension check
+    if suffix not in SUPPORTED_EXTENSIONS:
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": 0,
+            "skipped_pages": 0,
+            "status_note": "Unsupported",
+            "error": UNSUPPORTED_TYPE_MESSAGE,
+        }
 
-    # Extract
-    pages = _extract(str(path), suffix)
+    # 2. File size check (max 20 MB)
+    if len(file_bytes) > settings.max_file_size_bytes:
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": 0,
+            "skipped_pages": 0,
+            "status_note": "File too large",
+            "error": f"File exceeds the 20 MB limit ({len(file_bytes) / (1024*1024):.1f} MB).",
+        }
 
-    # Handle DRM
-    if pages and pages[0].get("text") == "__DRM_PROTECTED__":
-        return _error_report(
-            original_filename, collection,
-            "This EPUB is DRM-protected and cannot be read. "
-            "Please use a DRM-free copy."
-        )
+    # 3. Extract text
+    tmp_path = None
+    try:
+        # Write to a temporary file for libraries that require a file path
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
 
-    if not pages:
-        return _empty_report(original_filename, collection)
+        extraction = _extract_file(tmp_path, suffix)
+    except Exception as e:
+        logger.warning(f"Extraction error for {filename}: {e}")
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": 0,
+            "skipped_pages": 0,
+            "status_note": "Error",
+            "error": f"Could not read file: {str(e)}",
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
-    total_chars = sum(len(p.get("text", "")) for p in pages)
-    pages_ocrd = sum(1 for p in pages if p.get("extraction_method") == "ocr")
+    # 4. Check for extraction-level errors (DRM, corrupt, password, empty)
+    if extraction.get("error"):
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": 0,
+            "skipped_pages": 0,
+            "status_note": "Rejected",
+            "error": extraction["error"],
+        }
 
-    # Check near-empty
-    warnings = []
-    if total_chars < 100:
-        warnings.append(
-            "⚠️ **No readable text found** — this document may be scanned or image-only. "
-            "Install Tesseract OCR to extract text from scanned documents."
-        )
+    pages = extraction.get("pages", [])
+    total_chars = extraction.get("total_chars", 0)
+    image_only_pages = extraction.get("image_only_pages", 0)
+    total_pages = len(pages)
 
-    doc_id = str(uuid.uuid4())
+    if total_pages == 0:
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": 0,
+            "skipped_pages": 0,
+            "status_note": "Empty file",
+            "error": "This file contains no readable content.",
+        }
 
-    # Add year/subject metadata to each page for past_papers
-    extra_meta = {}
-    if year:
-        extra_meta["year"] = year
-    if subject:
-        extra_meta["subject"] = subject
+    # 5. Scanned / image-based detection rules:
+    # - If the whole document has fewer than 300 characters of text,
+    # - OR more than 70% of its pages/slides are image-only:
+    #   REJECT it with SCANNED_FILE_MESSAGE. Do not index it.
+    image_only_ratio = image_only_pages / total_pages if total_pages > 0 else 0.0
+    if total_chars < settings.min_doc_text_chars or image_only_ratio > settings.max_image_only_ratio:
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": total_pages,
+            "skipped_pages": image_only_pages,
+            "status_note": "Scanned/Image-based",
+            "error": SCANNED_FILE_MESSAGE,
+        }
 
-    chunks = chunk_pages(
+    # 6. Chunking
+    chunks_obj = chunk_pages(
         pages=pages,
-        doc_name=original_filename,
-        collection=collection,
-        doc_id=doc_id,
+        doc_name=filename,
+        target_tokens=settings.chunk_target_tokens,
+        overlap_tokens=settings.chunk_overlap_tokens,
     )
+    chunks = [c.to_dict() for c in chunks_obj]
 
-    # Add extra metadata to each chunk
-    chunk_dicts = []
-    for c in chunks:
-        d = c.to_dict()
-        d["metadata"].update(extra_meta)
-        chunk_dicts.append(d)
+    if not chunks:
+        return {
+            "success": False,
+            "doc_name": filename,
+            "chunks": [],
+            "total_pages": total_pages,
+            "skipped_pages": image_only_pages,
+            "status_note": "No text",
+            "error": SCANNED_FILE_MESSAGE,
+        }
+
+    # 7. Note on skipped pages
+    if image_only_pages > 0:
+        status_note = f"{image_only_pages} pages/slides had no readable text and were skipped."
+    else:
+        status_note = "Ready"
 
     return {
-        "doc_id": doc_id,
-        "doc_name": original_filename,
-        "collection": collection,
-        "total_pages": len(pages),
-        "total_chunks": len(chunk_dicts),
-        "chunks_list": chunk_dicts,
-        "pages_ocrd": pages_ocrd,
-        "chars_extracted": total_chars,
-        "status": "processed",
-        "message": f"Extracted {total_chars:,} chars from {len(pages)} pages, created {len(chunk_dicts)} chunks.",
-        "extraction_warnings": warnings,
-        "year": year,
-        "subject": subject,
+        "success": True,
+        "doc_name": filename,
+        "chunks": chunks,
+        "total_pages": total_pages,
+        "skipped_pages": image_only_pages,
+        "status_note": status_note,
+        "error": None,
     }
 
 
-def save_uploaded_file(file_content: bytes, original_filename: str) -> str:
-    """Save file bytes to uploads dir with unique prefix."""
-    from core.config import settings
-    uploads_dir = settings.uploads_dir
-    unique = f"{uuid.uuid4().hex[:8]}_{original_filename}"
-    save_path = uploads_dir / unique
-    save_path.write_bytes(file_content)
-    logger.info(f"Saved: {save_path}")
-    return str(save_path)
+def _extract_file(file_path: str, suffix: str) -> dict:
+    """Dispatch file extraction by extension."""
+    if suffix == ".pdf":
+        from core.ingestion.pdf_extractor import extract_text_from_pdf
+        return extract_text_from_pdf(file_path)
 
+    elif suffix in (".pptx", ".ppt"):
+        from core.ingestion.pptx_extractor import extract_text_from_pptx
+        return extract_text_from_pptx(file_path)
 
-def detect_paper_metadata(filename: str) -> dict:
-    """Auto-detect year and subject from filename."""
-    import re
-    meta = {}
-    m = re.search(r"(20\d{2})", filename)
-    if m:
-        meta["year"] = m.group(1)
-    stem = Path(filename).stem
-    if "year" in meta:
-        stem = stem.replace(meta["year"], "")
-    fillers = {
-        "question","paper","exam","endterm","midterm","final",
-        "mid","end","term","semester","sem","test","quiz",
-    }
-    parts = [p for p in stem.replace("_", " ").replace("-", " ").split()
-             if p.lower() not in fillers and len(p) > 1]
-    if parts:
-        meta["subject"] = " ".join(parts)
-    return meta
+    elif suffix in (".docx", ".doc"):
+        from core.ingestion.docx_extractor import extract_text_from_docx
+        return extract_text_from_docx(file_path)
 
+    elif suffix == ".epub":
+        from core.ingestion.epub_extractor import extract_text_from_epub
+        return extract_text_from_epub(file_path)
 
-# ── Private helpers ───────────────────────────────────────────────────────────
+    elif suffix in (".txt", ".md"):
+        try:
+            content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            cleaned = clean_text(content)
+            total_chars = len(cleaned.strip())
+            return {
+                "pages": [{
+                    "page_or_slide": 1,
+                    "text": cleaned,
+                    "is_image_only": False,
+                    "heading": "",
+                }],
+                "total_chars": total_chars,
+                "image_only_pages": 0,
+                "error": None if total_chars > 0 else "File is empty.",
+            }
+        except Exception as e:
+            return {
+                "pages": [],
+                "total_chars": 0,
+                "image_only_pages": 0,
+                "error": f"Failed to read text file: {str(e)}",
+            }
 
-def _extract(file_path: str, suffix: str) -> list[dict]:
-    """Dispatch to the correct extractor."""
-    extractor_ref = EXTRACTORS[suffix]
-
-    if extractor_ref == "_txt":
-        return _extract_txt(file_path)
-    if extractor_ref == "_img":
-        return _extract_image(file_path)
-
-    module_path, func_name = extractor_ref.rsplit(".", 1)
-    import importlib
-    module = importlib.import_module(module_path)
-    func = getattr(module, func_name)
-    return func(file_path)
-
-
-def _extract_txt(file_path: str) -> list[dict]:
-    try:
-        text = Path(file_path).read_text(encoding="utf-8", errors="replace")
-        return [{"page_or_slide": 1, "text": text, "extraction_method": "text", "heading": ""}]
-    except Exception as e:
-        logger.error(f"TXT read failed: {e}")
-        return []
-
-
-def _extract_image(file_path: str) -> list[dict]:
-    from core.ocr_helper import tesseract_available, ocr_image
-    if not tesseract_available():
-        return [{"page_or_slide": 1, "text": "", "extraction_method": "ocr_unavailable", "heading": ""}]
-    try:
-        from PIL import Image
-        img = Image.open(file_path)
-        text = ocr_image(img)
-        return [{"page_or_slide": 1, "text": text, "extraction_method": "ocr", "heading": ""}]
-    except Exception as e:
-        logger.error(f"Image OCR failed: {e}")
-        return []
-
-
-def _error_report(doc_name: str, collection: str, message: str) -> dict:
     return {
-        "doc_id": None, "doc_name": doc_name, "collection": collection,
-        "total_pages": 0, "total_chunks": 0, "chunks_list": [],
-        "pages_ocrd": 0, "chars_extracted": 0,
-        "status": "error", "message": message, "extraction_warnings": [message],
-    }
-
-
-def _empty_report(doc_name: str, collection: str) -> dict:
-    return {
-        "doc_id": None, "doc_name": doc_name, "collection": collection,
-        "total_pages": 0, "total_chunks": 0, "chunks_list": [],
-        "pages_ocrd": 0, "chars_extracted": 0,
-        "status": "empty",
-        "message": "No text could be extracted from this document.",
-        "extraction_warnings": [
-            "⚠️ **No readable text found** — likely scanned or image-only. "
-            "Install Tesseract OCR to extract text from scanned content."
-        ],
+        "pages": [],
+        "total_chars": 0,
+        "image_only_pages": 0,
+        "error": UNSUPPORTED_TYPE_MESSAGE,
     }

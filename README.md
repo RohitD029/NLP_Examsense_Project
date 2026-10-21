@@ -1,230 +1,83 @@
-# 🎓 ExamSense — AI-Powered Course Material & Exam Prep Assistant
+# ExamSense 🎓
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io/)
-[![Retrieval-Augmented Generation](https://img.shields.io/badge/NLP-Hybrid%20RAG-brightgreen.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+AI-powered study assistant that provides grounded, concise answers with direct source citations from your study materials.
 
-**ExamSense** is an advanced, production-grade Natural Language Processing (NLP) and Retrieval-Augmented Generation (RAG) platform tailored for students and educators. It ingests course materials (lecture slides, notes, textbooks) alongside past exam question papers, computes high-yield exam topic frequencies using semantic clustering, and generates grounded, cited answers to student queries with strict hallucination guards.
+## Features
+- **Library**: Upload text-based course documents (PDF, PPTX, DOCX, EPUB, TXT, MD). All processing and indexing are in-memory per session.
+- **Ask**: Fast hybrid search (Dense + BM25) with Reciprocal Rank Fusion, grounded Groq answers (<= 120 words), and expandable source chips.
+- **Teacher Mode**: Retrieval evaluation harness measuring Precision@3 and Recall@3 across Dense, BM25, and Hybrid methods with zero LLM calls.
 
----
+## Supported Files
+- **PDF**: Page-by-page text extraction via PyMuPDF.
+- **PPTX**: Slide titles, body text, tables, recursive shape grouping, and speaker notes via python-pptx.
+- **DOCX**: Structured headings, paragraphs, and tables via python-docx.
+- **EPUB**: Chapter-by-chapter extraction with title preservation via ebooklib + BeautifulSoup.
+- **TXT / MD**: Plain text files with unicode normalization.
 
-## 🌟 Key Features
+> **Note**: Scanned or image-only documents without selectable text are automatically detected and rejected.
 
-### 1. 📚 Multi-Format Document Ingestion
-- Supports **PDF**, **PPTX**, **DOCX**, **EPUB**, and **TXT**.
-- **OCR Fallback**: Automatically leverages **Tesseract OCR** for scanned documents or image-heavy slides.
-- **Smart Chunking**: Structure-aware chunking with customizable overlap to preserve semantic continuity across headings and code blocks.
+## Architecture
 
-### 2. ⚡ Hybrid Retrieval (Dense + Sparse)
-- **Dense Vector Search**: Powered by `BAAI/bge-small-en-v1.5` embeddings stored in high-performance **FAISS** vector indexes.
-- **Sparse Keyword Search**: Full-text BM25 ranking (`rank_bm25`) for exact terminologies, acronyms, and formulas.
-- **Reciprocal Rank Fusion (RRF)**: Combines dense and sparse ranking scores to deliver optimal recall and precision.
-
-### 3. 📊 Exam Frequency & Recency Weighting
-- Ingests past exam papers into an isolated collection.
-- Clusters exam questions using **Agglomerative Hierarchical Clustering** on semantic embeddings.
-- Applies exponential recency decay weighting so recent past papers exert higher influence in topic importance rankings.
-- Visualizes recurring exam themes and marks high-yield topics directly in study answers.
-
-### 4. 💬 Grounded Question Answering & Anti-Hallucination
-- **Multi-Provider LLM Integration**: Fast inference via **Groq** (`llama-3.3-70b-versatile`, `gpt-oss-120b`) with **Google Gemini** fallback.
-- **Direct Source Citations**: Every generated response includes exact document names, sections, and source chunk references.
-- **Confidence Gate**: Configurable similarity threshold that instructs the model to abstain from answering if course material does not contain relevant context.
-
-### 5. 🧪 End-to-End RAG Evaluation Suite
-- In-depth benchmarking metrics:
-  - **Hit@K** and **MRR@K** (Mean Reciprocal Rank)
-  - **Faithfulness** & **Answer Relevance**
-  - **Context Precision & Recall**
-  - Retrieval and generation latency profiling
-
----
-
-## 🏗️ System Architecture
-
-```
-                                  [ Upload Documents ]
-                                           │
-                    ┌──────────────────────┴──────────────────────┐
-                    ▼                                             ▼
-          [ Course Materials ]                            [ Past Exam Papers ]
-                    │                                             │
-      ┌─────────────┴─────────────┐                 ┌─────────────┴─────────────┐
-      ▼                           ▼                 ▼                           ▼
-[ Text Extraction ]      [ Tesseract OCR ]    [ Text Extraction ]      [ Question Parser ]
-      │                           │                 │                           │
-      └─────────────┬─────────────┘                 └─────────────┬─────────────┘
-                    ▼                                             ▼
-             [ Token Chunking ]                          [ Agglomerative Clustering ]
-                    │                                             │
-       ┌────────────┴────────────┐                        [ Recency Decay Scorer ]
-       ▼                         ▼                                │
-[ FAISS Dense Index ]   [ BM25 Sparse Index ]                     ▼
-       │                         │                       [ High-Yield Exam Topics ]
-       └────────────┬────────────┘                                │
-                    ▼                                             │
-      [ Reciprocal Rank Fusion (RRF) ]                            │
-                    │                                             │
-                    ├─────────────────────────────────────────────┘
-                    ▼
-     [ Augmented Prompt + Citations ]
-                    │
-                    ▼
-         [ Groq / Gemini LLM ]
-                    │
-                    ▼
-        [ Streamlit Interface ]
+```mermaid
+graph TD
+    Upload[User Uploads Files] --> Extract[Text Extraction per Page/Slide]
+    Extract --> Clean[Unicode Clean & Normalization]
+    Clean --> Chunk[Chunking ~200 Tokens with ~40 Overlap]
+    Chunk --> Index[FAISS IndexFlatIP + BM25Plus]
+    Query[User Query] --> Hybrid[Hybrid RRF Retrieval Top 3]
+    Hybrid --> Evidence{Sufficient Evidence?}
+    Evidence -->|No| Abstain[Abstain: Not Found in Material]
+    Evidence -->|Yes| Groq[Groq API LLM gpt-oss-20b]
+    Groq --> Response[Answer + Expandable Source Chips]
 ```
 
----
+## Running Locally
 
-## 📁 Repository Structure
+1. **Clone & create virtual environment (Python 3.12 recommended)**:
+   ```bash
+   python -m venv .venv
+   # Windows:
+   .venv\Scripts\activate
+   # Linux/macOS:
+   source .venv/bin/activate
+   ```
 
-```text
-NLP_Examsense_Project/
-├── app.py                      # Main Streamlit application entry point
-├── run.bat                     # Windows one-click start script
-├── check_system.bat            # Environment and dependency diagnostic script
-├── requirements.txt            # Python dependencies
-├── .env.example                # Example environment variable template
-├── .gitignore                  # Git ignore rules for virtualenvs and secrets
-├── core/
-│   ├── config.py               # Pydantic-based configuration & settings
-│   ├── ocr_helper.py           # Tesseract OCR extraction utility
-│   ├── evaluation/             # RAG evaluation runner and metrics
-│   │   ├── eval_metrics.py
-│   │   └── eval_runner.py
-│   ├── exam_frequency/         # Past paper question clustering and scoring
-│   │   ├── frequency_scorer.py
-│   │   └── question_clusterer.py
-│   ├── generation/             # LLM prompt templates and API client (Groq/Gemini)
-│   │   ├── llm_client.py
-│   │   └── prompt_templates.py
-│   ├── ingestion/              # Document parsers and chunking logic
-│   │   ├── chunker.py
-│   │   ├── document_parser.py
-│   │   └── file_handler.py
-│   └── retrieval/              # Hybrid retrieval system
-│       ├── bm25_retriever.py
-│       ├── embedder.py
-│       ├── hybrid_retriever.py
-│       └── vector_store.py
-├── data/
-│   ├── index/                  # Persisted FAISS and BM25 index stores (.gitkeep)
-│   └── uploads/                # User document uploads directory (.gitkeep)
-├── pages/
-│   ├── ask.py                  # Grounded Q&A interface with source citations
-│   ├── evaluation.py           # Evaluation benchmarking dashboard
-│   ├── exam_topics.py          # Exam frequency analytics and charts
-│   └── library.py              # Document upload and management center
-├── scripts/
-│   └── doctor.py               # System health and sanity check utility
-└── ui/
-    ├── components.py           # Reusable Streamlit UI components
-    ├── safe_page.py            # Error boundary wrapper for safe page rendering
-    └── styles.css              # Custom styling and design theme
-```
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
----
+3. **Configure API key (optional for local testing)**:
+   Copy `.env.example` to `.env` or `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`:
+   ```toml
+   GROQ_API_KEY = "gsk_your_groq_api_key_here"
+   ```
+   *(Or type your free Groq key directly in the sidebar inside the app).*
 
-## 🚀 Getting Started
+4. **Launch app**:
+   ```bash
+   streamlit run app.py
+   ```
 
-### Prerequisites
+## Deploying to Streamlit Community Cloud
 
-- **Python 3.10, 3.11, or 3.12**
-- **Git**
-- *(Optional, for scanned documents/images)* [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) installed and added to your system `PATH`.
+1. **Push your code to GitHub**:
+   Create a GitHub repository and push your project files (verify `.env` and `secrets.toml` are not committed).
 
-### 1. Clone the Repository
+2. **Deploy on Streamlit Community Cloud**:
+   - Go to [share.streamlit.io](https://share.streamlit.io/) and click **New app**.
+   - Select your repository and branch, set Main file path to `app.py`.
+   - Click **Advanced settings**:
+     - Choose **Python 3.12**.
+     - In **Secrets**, add your Groq API key:
+       ```toml
+       GROQ_API_KEY = "gsk_your_groq_api_key_here"
+       ```
+   - Click **Deploy**.
 
-```bash
-git clone https://github.com/RohitD029/NLP_Examsense_Project.git
-cd NLP_Examsense_Project
-```
-
-### 2. Set Up Virtual Environment
-
-```bash
-# Windows
-python -m venv .venv
-.venv\Scripts\activate
-
-# Linux / macOS
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install Dependencies
-
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### 4. Configure Environment Variables
-
-Copy `.env.example` to `.env` and fill in your API credentials:
-
-```bash
-copy .env.example .env     # On Windows
-# cp .env.example .env     # On Linux / macOS
-```
-
-Edit `.env`:
-```env
-# Groq API Key (Primary LLM - free from https://console.groq.com/keys)
-EXAMSENSE_GROQ_API_KEY=your_groq_api_key_here
-
-# Google Gemini API Key (Fallback LLM - free from https://aistudio.google.com/)
-EXAMSENSE_GEMINI_API_KEY=your_gemini_api_key_here
-```
-
----
-
-## 🖥️ Running the Application
-
-### Option A: Using the Windows Batch Script
-Simply double-click or run:
-```bash
-run.bat
-```
-
-### Option B: Running with Streamlit
-```bash
-streamlit run app.py
-```
-
-Open your browser at **`http://localhost:8501`**.
-
----
-
-## 💡 Usage Walkthrough
-
-1. **Upload Documents (`/library`)**:
-   - Upload course materials (slides, lecture notes, textbook chapters) under the **Course Materials** tab.
-   - Upload historical exam papers under the **Past Papers** tab.
-   - Click **Index Documents** to compute embeddings and build the BM25/FAISS stores.
-2. **Ask Questions (`/ask`)**:
-   - Ask concept queries, request code explanations, or ask for summaries.
-   - View retrieved source snippets, line references, similarity scores, and topic frequency badges.
-3. **Analyze Exam Trends (`/exam_topics`)**:
-   - Review automatically discovered recurring questions, semantic clusters, and frequency rankings.
-4. **Benchmark Performance (`/evaluation`)**:
-   - Run retrieval evaluation on standard or custom test sets to inspect Hit@K, MRR, Faithfulness, and latency.
-
----
-
-## 🛠️ Diagnostics & Sanity Check
-
-To run a full diagnostic on dependencies, embedding models, vector stores, and API connectivity:
-
-```bash
-python scripts/doctor.py
-```
-
----
-
-## 📄 License
-
-This project is open-source and available under the [MIT License](LICENSE).
+## Known Limitations
+- **Text-based files only**: Scanned PDFs and image-based presentations without selectable text are rejected.
+- **Figures, equations, and images**: Visual diagrams, handwritten equations, and raster images are not parsed.
+- **Free API rate limits**: Free Groq tier rate limits apply (per-session cap of 30 questions on shared key; users can supply their own free key to bypass).
+- **Session privacy**: Files, embeddings, and FAISS indices are held in memory only for the duration of the browser session and are never persisted to disk.
+- **Lightweight embedding model**: Uses `BAAI/bge-small-en-v1.5` (~230 MB RAM footprint) optimized for the free cloud tier.

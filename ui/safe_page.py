@@ -2,12 +2,13 @@
 Safe Page Wrapper
 =================
 Catches unexpected exceptions during page render, logs full tracebacks to
-logs/app.log, and renders a clean friendly error card to the user.
-Re-raises Streamlit control-flow exceptions (st.rerun, st.stop, st.switch_page).
+logs/app.log (or stderr if filesystem is read-only), and renders a clean friendly error card.
+Never swallows Streamlit control-flow exceptions (st.rerun, st.stop, st.switch_page).
 """
 from __future__ import annotations
 
 import logging
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +36,7 @@ def is_streamlit_control_flow(e: BaseException) -> bool:
 def safe_page(render_fn: Callable[[], None]) -> None:
     """
     Execute a page function safely.
-    Catches unhandled errors, logs traceback to logs/app.log, and shows
+    Catches unhandled errors, logs traceback to logs/app.log or stderr, and shows
     a friendly error card without raw tracebacks.
     """
     try:
@@ -44,15 +45,19 @@ def safe_page(render_fn: Callable[[], None]) -> None:
         if is_streamlit_control_flow(e):
             raise e
 
-        # Ensure logs directory exists
+        # Format traceback
+        tb = traceback.format_exc()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"\n{'='*70}\n[{timestamp}] UNHANDLED ERROR: {e}\n{tb}\n{'='*70}\n"
+
+        # Ensure logs directory exists and write to logs/app.log
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            tb = traceback.format_exc()
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(APP_LOG, "a", encoding="utf-8") as f:
-                f.write(f"\n{'='*70}\n[{timestamp}] UNHANDLED ERROR: {e}\n{tb}\n{'='*70}\n")
-        except Exception as log_err:
-            logger.error(f"Failed to write to app.log: {log_err}")
+                f.write(log_entry)
+        except Exception:
+            sys.stderr.write(log_entry)
+            sys.stderr.flush()
 
         logger.error(f"Page render error: {e}", exc_info=True)
 
@@ -60,7 +65,7 @@ def safe_page(render_fn: Callable[[], None]) -> None:
         st.markdown(
             error_card(
                 "Unable to display page",
-                "An unexpected issue occurred while loading this view. The technical details have been logged to logs/app.log.",
+                "An unexpected issue occurred while loading this view. Please try again or re-upload your document.",
             ),
             unsafe_allow_html=True,
         )

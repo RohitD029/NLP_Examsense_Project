@@ -1,126 +1,100 @@
 """
 BM25 Sparse Index
 =================
-Built from chunks.jsonl via rank_bm25. Persisted as bm25_index.pkl.
-Rebuilt on every add/delete (fast — in-memory only).
+In-memory BM25 index using rank_bm25 and bm25_tokenize.
+Per-session only — no disk persistence.
+Rebuilt on document add/delete.
 """
 from __future__ import annotations
 
 import logging
-import pickle
-import re
-from pathlib import Path
+from typing import Optional
+
+from rank_bm25 import BM25Plus
+from core.nlp.preprocess import bm25_tokenize
 
 logger = logging.getLogger(__name__)
 
-_STOPWORDS = {
-    "the","a","an","is","are","was","were","be","been","being","have","has",
-    "had","do","does","did","will","would","could","should","may","might",
-    "shall","can","to","of","in","for","on","with","at","by","from","as",
-    "into","through","during","before","after","above","below","between",
-    "out","off","over","under","again","further","then","once","and","but",
-    "or","nor","not","no","so","than","too","very","just","also","it","its",
-    "this","that","these","those","he","she","they","we","you","i","me","my",
-    "your","his","her","their","our",
-}
 
-# module-level store: {collection: {bm25, chunk_ids, chunks}}
-_indices: dict[str, dict] = {}
+def build_bm25_index(chunks: list[dict]) -> dict:
+    """
+    Build in-memory BM25 index from a list of chunks.
 
-
-def _tokenize(text: str) -> list[str]:
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return [t for t in tokens if len(t) > 1 and t not in _STOPWORDS]
-
-
-def build_index(chunks: list[dict], collection: str) -> None:
-    """Build BM25 index for a collection from a list of chunk dicts."""
-    from rank_bm25 import BM25Plus
-    from core.config import settings
-
+    Returns dict containing:
+      bm25: BM25Plus instance (or None)
+      chunks: list[dict]
+      tokenized_corpus: list[list[str]]
+      token_sets: list[set[str]]
+    """
     if not chunks:
-        _indices[collection] = {"bm25": None, "chunk_ids": [], "chunks": [], "token_sets": []}
-        _save(collection, settings)
-        return
+        return {
+            "bm25": None,
+            "chunks": [],
+            "tokenized_corpus": [],
+            "token_sets": [],
+        }
 
-    tokenized = [_tokenize(c["text"]) for c in chunks]
-    token_sets = [set(t) for t in tokenized]
-    _indices[collection] = {
-        "bm25": BM25Plus(tokenized),
-        "chunk_ids": [c["chunk_id"] for c in chunks],
+    tokenized_corpus = [bm25_tokenize(c["text"]) for c in chunks]
+    token_sets = [set(t) for t in tokenized_corpus]
+
+    # Handle cases where all documents have no non-stopword tokens
+    non_empty = [t for t in tokenized_corpus if t]
+    bm25 = BM25Plus(tokenized_corpus) if non_empty else None
+
+    return {
+        "bm25": bm25,
         "chunks": chunks,
+        "tokenized_corpus": tokenized_corpus,
         "token_sets": token_sets,
     }
-    _save(collection, settings)
-    logger.info(f"BM25 index built for '{collection}': {len(chunks)} docs")
 
 
-def rebuild_from_store(collection: str) -> None:
-    """Rebuild BM25 from the live vector store."""
-    from core.retrieval.vector_store import get_all_chunks
-    chunks = get_all_chunks(collection)
-    build_index(chunks, collection)
-
-
-def query_index(query: str, collection: str, top_k: int = 10) -> list[dict]:
-    """Return top_k BM25 results for query in collection."""
-    idx = _indices.get(collection)
-    if not idx:
-        load_index(collection)
-        idx = _indices.get(collection)
-    if not idx or idx.get("bm25") is None:
+def query_bm25(
+    query: str,
+    bm25_data: dict,
+    top_k: int = 8,
+    doc_filter: Optional[str] = None,
+) -> list[dict]:
+    """
+    Query the BM25 index. Returns top_k chunks ranked by BM25 score.
+    """
+    if not bm25_data or not bm25_data.get("bm25") or not bm25_data.get("chunks"):
         return []
 
-    tokens = _tokenize(query)
+    tokens = bm25_tokenize(query)
     if not tokens:
         return []
 
-    scores = idx["bm25"].get_scores(tokens)
-    top_n = min(top_k, len(scores))
-    top_idxs = scores.argsort()[::-1][:top_n]
+    bm25 = bm25_data["bm25"]
+    chunks = bm25_data["chunks"]
+    token_sets = bm25_data.get("token_sets", [])
 
-    query_tokens = set(tokens)
-    token_sets = idx.get("token_sets")
+    scores = bm25.get_scores(tokens)
+    query_token_set = set(tokens)
+
+    # Filter by doc_filter if specified
+    scored_candidates = []
+    for i, chunk in enumerate(chunks):
+        if doc_filter and doc_filter != "All documents":
+            if chunk.get("metadata", {}).get("doc_name") != doc_filter:
+                continue
+
+        score = float(scores[i])
+        # Only return items with positive score and token overlap
+        has_overlap = bool(query_token_set & token_sets[i]) if (i < len(token_sets)) else (score > 0)
+        if has_overlap and score > 0:
+            scored_candidates.append((score, chunk))
+
+    # Sort descending by score
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
     results = []
-    for i in top_idxs:
-        has_match = (bool(query_tokens & token_sets[i])) if (token_sets and i < len(token_sets)) else (scores[i] > 0)
-        if has_match and scores[i] > 0:
-            chunk = idx["chunks"][i]
-            results.append({
-                "chunk_id": chunk["chunk_id"],
-                "text": chunk["text"],
-                "metadata": chunk["metadata"],
-                "score": float(scores[i]),
-                "collection": collection,
-            })
+    for score, chunk in scored_candidates[:top_k]:
+        results.append({
+            "chunk_id": chunk["chunk_id"],
+            "text": chunk["text"],
+            "metadata": chunk.get("metadata", {}),
+            "score": score,
+        })
+
     return results
-
-
-def load_index(collection: str) -> None:
-    """Load BM25 index from disk."""
-    from core.config import settings
-    path = _pkl_path(collection, settings)
-    if path.exists():
-        try:
-            with open(path, "rb") as f:
-                _indices[collection] = pickle.load(f)
-            logger.info(f"BM25 loaded from {path}")
-        except Exception as e:
-            logger.error(f"BM25 load failed: {e}")
-
-
-def _save(collection: str, settings) -> None:
-    path = _pkl_path(collection, settings)
-    try:
-        tmp = path.with_suffix(".tmp.pkl")
-        with open(tmp, "wb") as f:
-            pickle.dump(_indices[collection], f)
-        import shutil
-        shutil.move(str(tmp), str(path))
-    except Exception as e:
-        logger.error(f"BM25 save failed: {e}")
-
-
-def _pkl_path(collection: str, settings) -> Path:
-    return settings.index_dir / f"bm25_{collection}.pkl"

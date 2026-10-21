@@ -1,14 +1,13 @@
 """
 ExamSense — Streamlit Application Entry Point
 ================================================
-Single-page-app with navigation via st.navigation / st.Page.
-Injects custom CSS, renders sidebar with stats, single source of truth settings,
-and connection testing.
+Single-page navigation with dark premium styling.
+Sidebar: logo, navigation, API key field + pill with Test button, and Teacher mode toggle.
 """
 from __future__ import annotations
 
-import sys
 import logging
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -26,13 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("examsense.app")
 
-# ── Preload persisted indices ──
-try:
-    from core.exam_frequency.question_clusterer import load_clusters
-    load_clusters()
-except Exception as e:
-    logger.debug(f"Preload clusters skipped: {e}")
-
 # ── Page config (must be first Streamlit call) ──
 st.set_page_config(
     page_title="ExamSense",
@@ -48,14 +40,20 @@ if css_path.exists():
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 # ── Import UI helpers ──
-from ui.components import status_pill, sidebar_stat
+from ui.components import status_pill
 from ui.safe_page import safe_page
-from core.generation.llm_client import check_llm_status, test_groq_connection
-from core.config import settings
+from core.generation.llm_client import get_active_groq_key, test_groq_connection
 
-# Pre-populate session state API key from settings/.env before widgets render
-if "sidebar_groq_key" not in st.session_state:
-    st.session_state["sidebar_groq_key"] = settings.groq_api_key
+# ── Navigation Definition ──
+# Library and Ask always; Evaluation only when Teacher mode is ON
+nav_pages = [
+    st.Page("pages/library.py", title="Library", icon="📚"),
+    st.Page("pages/ask.py", title="Ask", icon="💬"),
+]
+if st.session_state.get("teacher_mode", False):
+    nav_pages.append(st.Page("pages/evaluation.py", title="Evaluation", icon="🧪"))
+
+pg = st.navigation(nav_pages)
 
 # ── Sidebar ──
 with st.sidebar:
@@ -63,94 +61,34 @@ with st.sidebar:
     st.caption("AI-Powered Study Assistant")
     st.markdown("---")
 
-    # Collection stats
-    try:
-        from core.retrieval.vector_store import get_collection_stats
-        cm_stats = get_collection_stats("course_material")
-        pp_stats = get_collection_stats("past_papers")
-    except Exception:
-        cm_stats = {"total_documents": 0, "total_chunks": 0}
-        pp_stats = {"total_documents": 0, "total_chunks": 0}
-
-    st.markdown(sidebar_stat("📚 Course Docs", cm_stats.get("total_documents", 0)), unsafe_allow_html=True)
-    st.markdown(sidebar_stat("📝 Past Papers", pp_stats.get("total_documents", 0)), unsafe_allow_html=True)
-    st.markdown(
-        sidebar_stat("🧩 Total Chunks", cm_stats.get("total_chunks", 0) + pp_stats.get("total_chunks", 0)),
-        unsafe_allow_html=True,
+    # API key input (optional user key)
+    st.text_input(
+        "Use your own Groq key (optional)",
+        type="password",
+        key="sidebar_user_groq_key",
+        help="Free key at https://console.groq.com/keys. Overrides shared key and removes question limits.",
     )
+
+    # API key status pill + Test button
+    active_key = get_active_groq_key()
+    has_key = bool(active_key)
+    pill_label = "Ready" if has_key else "Add key"
+
+    col_pill, col_test = st.columns([1, 1])
+    with col_pill:
+        st.markdown(status_pill(pill_label, is_ready=has_key), unsafe_allow_html=True)
+    with col_test:
+        if st.button("Test", key="btn_test_sidebar_groq", use_container_width=True):
+            test_res = test_groq_connection(active_key)
+            if test_res["ready"]:
+                st.success("Connected!")
+            else:
+                st.error(test_res.get("status_text", "Failed"))
 
     st.markdown("---")
 
-    # Model status
-    llm_status = check_llm_status()
-    if llm_status.get("ready"):
-        st.markdown(status_pill(llm_status.get("status_text", "✓ Ready"), is_ready=True), unsafe_allow_html=True)
-    else:
-        st.markdown(status_pill(llm_status.get("status_text", "✗ Not Ready"), is_ready=False), unsafe_allow_html=True)
-        reason = llm_status.get("reason", "")
-        if reason:
-            st.caption(f"{reason}")
+    # Teacher mode toggle (default OFF)
+    st.toggle("Teacher mode", key="teacher_mode")
 
-    # Settings expander
-    with st.expander("⚙️ Settings", expanded=False):
-        def _on_key_change():
-            new_key = st.session_state.get("sidebar_groq_key", "").strip()
-            settings.groq_api_key = new_key
-            st.session_state["groq_conn_status"] = {"key": new_key, "status": test_groq_connection(new_key)}
-
-        st.text_input(
-            "Groq API Key",
-            type="password",
-            key="sidebar_groq_key",
-            on_change=_on_key_change,
-            help="Get free key at https://console.groq.com/keys",
-        )
-
-        if st.button("🔄 Test Connection", key="btn_test_sidebar_conn", use_container_width=True):
-            curr_key = st.session_state.get("sidebar_groq_key", "").strip()
-            status = test_groq_connection(curr_key)
-            st.session_state["groq_conn_status"] = {"key": curr_key, "status": status}
-            if status.get("ready"):
-                st.success(f"Connected! Model: {status.get('model')}")
-            else:
-                st.error(status.get("reason"))
-            st.rerun()
-
-        st.text_input(
-            "Gemini API Key (optional)",
-            value=settings.gemini_api_key,
-            type="password",
-            key="sidebar_gemini_key",
-            help="Get free key at https://aistudio.google.com/",
-        )
-
-        def _on_threshold_change():
-            settings.confidence_threshold = st.session_state.sidebar_threshold
-
-        st.slider(
-            "Confidence Threshold",
-            min_value=0.1, max_value=0.8,
-            value=settings.confidence_threshold,
-            step=0.05,
-            key="sidebar_threshold",
-            on_change=_on_threshold_change,
-            help="Below this similarity → abstain from answering",
-        )
-
-        st.caption(f"Model: {settings.groq_primary_model}")
-        st.caption(f"Embedding: {settings.embedding_model_name}")
-        st.caption(f"Chunk size: {settings.max_chunk_chars} chars")
-
-
-# ── Navigation ──
-pages = {
-    "📚 Library": st.Page("pages/library.py", title="Library", icon="📚"),
-    "💬 Ask": st.Page("pages/ask.py", title="Ask", icon="💬"),
-    "📊 Exam Topics": st.Page("pages/exam_topics.py", title="Exam Topics", icon="📊"),
-    "🧪 Evaluation": st.Page("pages/evaluation.py", title="Evaluation", icon="🧪"),
-}
-
-pg = st.navigation(list(pages.values()))
-
-# Execute navigation run inside safe wrapper
+# ── Execute page run inside safe wrapper ──
 safe_page(pg.run)
